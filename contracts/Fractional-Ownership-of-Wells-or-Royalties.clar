@@ -12,6 +12,10 @@
 (define-constant err-invalid-amount (err u106))
 (define-constant err-already-claimed (err u107))
 (define-constant err-insufficient-balance (err u108))
+(define-constant err-not-listed (err u109))
+(define-constant err-already-listed (err u110))
+(define-constant err-invalid-price (err u111))
+(define-constant err-no-offer (err u112))
 
 (define-data-var total-shares uint u0)
 (define-data-var total-revenue uint u0)
@@ -28,6 +32,8 @@
 (define-map share-metadata uint {minted-at: uint, original-owner: principal})
 (define-map dividend-history uint {amount: uint, block-height: uint, shares: uint})
 (define-map pending-claims principal uint)
+(define-map share-listings uint {seller: principal, price: uint, listed-at: uint})
+(define-map share-offers {token-id: uint, buyer: principal} {price: uint, offered-at: uint})
 
 (define-read-only (get-last-token-id)
   (ok (var-get total-shares))
@@ -91,6 +97,14 @@
 
 (define-read-only (has-claimed-dividend (owner principal) (period uint))
   (ok (default-to false (map-get? claimed-dividends {owner: owner, period: period})))
+)
+
+(define-read-only (get-listing (token-id uint))
+  (ok (map-get? share-listings token-id))
+)
+
+(define-read-only (get-offer (token-id uint) (buyer principal))
+  (ok (map-get? share-offers {token-id: token-id, buyer: buyer}))
 )
 
 (define-read-only (calculate-dividends (owner principal))
@@ -258,6 +272,103 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (asserts! (> amount u0) err-invalid-amount)
     (try! (as-contract (stx-transfer? amount tx-sender contract-owner)))
+    (ok true)
+  )
+)
+
+(define-public (list-share (token-id uint) (price uint))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? well-share token-id) err-does-not-exist))
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (is-none (map-get? share-listings token-id)) err-already-listed)
+    (asserts! (> price u0) err-invalid-price)
+    (map-set share-listings token-id {
+      seller: tx-sender,
+      price: price,
+      listed-at: stacks-block-height
+    })
+    (ok true)
+  )
+)
+
+(define-public (cancel-listing (token-id uint))
+  (let
+    (
+      (listing (unwrap! (map-get? share-listings token-id) err-not-listed))
+      (seller (get seller listing))
+    )
+    (asserts! (is-eq tx-sender seller) err-not-token-owner)
+    (map-delete share-listings token-id)
+    (ok true)
+  )
+)
+
+(define-public (buy-listed-share (token-id uint))
+  (let
+    (
+      (listing (unwrap! (map-get? share-listings token-id) err-not-listed))
+      (seller (get seller listing))
+      (price (get price listing))
+      (seller-shares (default-to (list) (map-get? owner-shares seller)))
+      (buyer-shares (default-to (list) (map-get? owner-shares tx-sender)))
+    )
+    (try! (stx-transfer? price tx-sender seller))
+    (try! (nft-transfer? well-share token-id seller tx-sender))
+    (map-set share-owners token-id tx-sender)
+    (map-set owner-shares seller (filter-share seller-shares token-id))
+    (map-set owner-shares tx-sender (unwrap! (as-max-len? (append buyer-shares token-id) u100) err-invalid-amount))
+    (map-delete share-listings token-id)
+    (ok true)
+  )
+)
+
+(define-public (make-offer (token-id uint) (price uint))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? well-share token-id) err-does-not-exist))
+    )
+    (asserts! (not (is-eq tx-sender owner)) err-not-token-owner)
+    (asserts! (> price u0) err-invalid-price)
+    (map-set share-offers {token-id: token-id, buyer: tx-sender} {
+      price: price,
+      offered-at: stacks-block-height
+    })
+    (ok true)
+  )
+)
+
+(define-public (cancel-offer (token-id uint))
+  (let
+    (
+      (offer (unwrap! (map-get? share-offers {token-id: token-id, buyer: tx-sender}) err-no-offer))
+    )
+    (map-delete share-offers {token-id: token-id, buyer: tx-sender})
+    (ok true)
+  )
+)
+
+(define-public (accept-offer (token-id uint) (buyer principal))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? well-share token-id) err-does-not-exist))
+      (offer (unwrap! (map-get? share-offers {token-id: token-id, buyer: buyer}) err-no-offer))
+      (price (get price offer))
+      (seller-shares (default-to (list) (map-get? owner-shares tx-sender)))
+      (buyer-shares (default-to (list) (map-get? owner-shares buyer)))
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (try! (stx-transfer? price buyer tx-sender))
+    (try! (nft-transfer? well-share token-id tx-sender buyer))
+    (map-set share-owners token-id buyer)
+    (map-set owner-shares tx-sender (filter-share seller-shares token-id))
+    (map-set owner-shares buyer (unwrap! (as-max-len? (append buyer-shares token-id) u100) err-invalid-amount))
+    (map-delete share-offers {token-id: token-id, buyer: buyer})
+    (if (is-some (map-get? share-listings token-id))
+      (map-delete share-listings token-id)
+      true
+    )
     (ok true)
   )
 )
